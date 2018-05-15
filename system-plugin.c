@@ -7,6 +7,10 @@
 #include <sys/utsname.h>
 #include <time.h>
 
+#include <sys/types.h>
+#include <pwd.h>
+#include <errno.h>
+
 // Next:
 // ? Timezone
 // X NTP (software specific)
@@ -20,11 +24,13 @@
 static void
 print_value(sr_val_t *value)
 {
+    syslog(LOG_DEBUG, "Value type = %d", value->type);
     switch (value->type) {
         case SR_CONTAINER_T:
         case SR_CONTAINER_PRESENCE_T:
         case SR_LIST_T:
             /* do not print */
+            syslog(LOG_DEBUG, "[list/container]");
             break;
         case SR_STRING_T:
             syslog(LOG_DEBUG, "%s = '%s'", value->xpath, value->data.string_val);
@@ -49,8 +55,99 @@ print_value(sr_val_t *value)
             break;
         default:
             syslog(LOG_DEBUG, "%s (unprintable)", value->xpath);
+            syslog(LOG_DEBUG, "## %s ##", value->data.string_val);
     }
 } 
+
+char* 
+get_user_homedir(char *username) {
+    struct passwd pwd;
+    struct passwd *result;
+    char *buf;
+    size_t bufsize;
+    int s;
+    bufsize = sysconf(_SC_GETPW_R_SIZE_MAX);
+    if (bufsize == -1) bufsize = 16384;  /* Value was indeterminate */
+    buf = malloc(bufsize);
+    if (buf == NULL) {
+        perror("malloc");
+        exit(EXIT_FAILURE);
+    }
+    s = getpwnam_r(username, &pwd, buf, bufsize, &result);
+    if (result == NULL) {
+        if (s == 0)
+            printf("Not found\n");
+        else {
+            errno = s;
+            perror("getpwnam_r");
+        }
+        return NULL;
+    }
+    //syslog(LOG_DEBUG, "ULU Name: %s; UID: %d, HOME: %s\n", pwd.pw_gecos, (long) pwd.pw_uid, pwd.pw_dir);
+    char *ret = strdup(pwd.pw_dir);
+    free(buf);
+    return ret;
+}
+
+static void
+update_local_user(sr_session_ctx_t *session, char *username)
+{
+    syslog(LOG_DEBUG, "------------------------------------------------------");
+    syslog(LOG_DEBUG, "ULU username = %s", username);
+    
+    int rc = SR_ERR_OK;
+    char *xpath = malloc(strlen(username) + 1024);
+    strcpy(xpath, "/ietf-system:system/authentication/user[name='");
+    strcat(xpath, username);
+    strcat(xpath, "']/authorized-key/name");
+    syslog(LOG_DEBUG, "ULU final XPath: %s", xpath);
+    
+    char *home = get_user_homedir(username);
+    if (home != NULL) {
+        syslog(LOG_DEBUG, "ULU homedir: %s", home);
+    } else {
+        syslog(LOG_DEBUG, "ULU there is no homedir!");
+    }
+    
+    sr_val_t * keys = NULL;
+    size_t cnt = 0;
+    rc = sr_get_items(session, xpath, &keys, &cnt);
+    if (SR_ERR_NOT_FOUND == rc) {
+        syslog(LOG_DEBUG, "NOT FOUND error by retrieving keys: %s", sr_strerror(rc));
+    } else if (SR_ERR_OK != rc) {
+        syslog(LOG_DEBUG, "GENERIC error by retrieving keys: %s", sr_strerror(rc));
+        return;
+    } else {
+        syslog(LOG_DEBUG, "ULU %d keys recieved", (int)cnt);
+        for (size_t i=0; i<cnt; i++) {
+            // new xpath for given key
+            strcpy(xpath, "/ietf-system:system/authentication/user[name='");
+            strcat(xpath, username);
+            strcat(xpath, "']/authorized-key[name='");
+            strcat(xpath, (&keys[i])->data.string_val);
+            strcat(xpath, "']//*");
+            syslog(LOG_DEBUG, "ULU key XPath: %s", xpath);
+            
+            sr_val_t * keydatas = NULL;
+            size_t kcnt = 0;
+            rc = sr_get_items(session, xpath, &keydatas, &kcnt);
+            if (SR_ERR_NOT_FOUND == rc) {
+                syslog(LOG_DEBUG, "NOT FOUND error by retrieving keydata: %s", sr_strerror(rc));
+            } else if (SR_ERR_OK != rc) {
+                syslog(LOG_DEBUG, "GENERIC error by retrieving keydata: %s", sr_strerror(rc));
+                break;
+            } else {
+                syslog(LOG_DEBUG, "ULU %d data recieved", (int)kcnt);
+                for (size_t j=0; j<kcnt; j++) {
+                    print_value(&keydatas[j]);
+                }
+            }
+        }
+    } 
+    syslog(LOG_DEBUG, "------------------------------------------------------");
+    free(xpath);
+    free(home);
+}
 
 static void
 retrieve_current_config(sr_session_ctx_t *session)
@@ -77,6 +174,24 @@ retrieve_current_config(sr_session_ctx_t *session)
     if (SR_ERR_OK != rc) {
         sr_free_val(value);
     }
+    
+    sr_val_t * values = NULL;
+    size_t cnt = 0;
+    rc = sr_get_items(session, "/ietf-system:system/authentication/user/name", &values, &cnt);
+    if (SR_ERR_NOT_FOUND == rc) {
+        syslog(LOG_DEBUG, "NOT FOUND error by retrieving configuration: %s", sr_strerror(rc));
+    } else if (SR_ERR_OK != rc) {
+        syslog(LOG_DEBUG, "GENERIC error by retrieving configuration: %s", sr_strerror(rc));
+        return;
+    } else {
+        syslog(LOG_DEBUG, "%d items recieved", (int)cnt);
+        for (size_t i=0; i<cnt; i++) {
+            print_value(&values[i]);
+            
+            update_local_user(session, (&values[i])->data.string_val);
+            
+        }
+    }  
 }
 
 static int
