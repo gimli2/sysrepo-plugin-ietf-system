@@ -16,6 +16,42 @@
 //   Set datetime RPC
 //   Restart and shutdown RPCs (done)
 
+/* prints one value retrieved from sysrepo */
+static void
+print_value(sr_val_t *value)
+{
+    switch (value->type) {
+        case SR_CONTAINER_T:
+        case SR_CONTAINER_PRESENCE_T:
+        case SR_LIST_T:
+            /* do not print */
+            break;
+        case SR_STRING_T:
+            syslog(LOG_DEBUG, "%s = '%s'", value->xpath, value->data.string_val);
+            break;
+        case SR_BOOL_T:
+            syslog(LOG_DEBUG, "%s = %s", value->xpath, value->data.bool_val ? "true" : "false");
+            break;
+        case SR_UINT8_T:
+            syslog(LOG_DEBUG, "%s = %u", value->xpath, value->data.uint8_val);
+            break;
+        case SR_UINT16_T:
+            syslog(LOG_DEBUG, "%s = %u", value->xpath, value->data.uint16_val);
+            break;
+        case SR_UINT32_T:
+            syslog(LOG_DEBUG, "%s = %u", value->xpath, value->data.uint32_val);
+            break;
+        case SR_IDENTITYREF_T:
+            syslog(LOG_DEBUG, "%s = %s", value->xpath, value->data.identityref_val);
+            break;
+        case SR_ENUM_T:
+            syslog(LOG_DEBUG, "%s = %s", value->xpath, value->data.enum_val);
+            break;
+        default:
+            syslog(LOG_DEBUG, "%s (unprintable)", value->xpath);
+    }
+} 
+
 static void
 retrieve_current_config(sr_session_ctx_t *session)
 {
@@ -170,15 +206,15 @@ int exec_rpc_cb(const char *xpath, const sr_val_t *input, const size_t input_cnt
     return SR_ERR_OK;
 }
 
-
+/* Registers for providing of operational data under given xpath. */  
+/* Registers for providing of operational data under given xpath. */  
 int
 sr_plugin_init_cb(sr_session_ctx_t *session, void **private_ctx)
 {
     sr_subscription_ctx_t *subscription = NULL;
     int rc = SR_ERR_OK;
 
-    rc = sr_module_change_subscribe(session, "ietf-system", module_change_cb, NULL, 0,
-            SR_SUBSCR_CTX_REUSE, &subscription);
+    rc = sr_module_change_subscribe(session, "ietf-system", module_change_cb, NULL, 0, SR_SUBSCR_CTX_REUSE, &subscription);
     if (SR_ERR_OK != rc) {
         goto error;
     }
