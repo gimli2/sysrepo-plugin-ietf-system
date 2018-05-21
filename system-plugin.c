@@ -11,6 +11,8 @@
 #include <pwd.h>
 #include <errno.h>
 
+#include <sys/stat.h>
+
 // Next:
 // ? Timezone
 // X NTP (software specific)
@@ -81,6 +83,7 @@ get_user_homedir(char *username) {
             errno = s;
             perror("getpwnam_r");
         }
+        free(buf);
         return NULL;
     }
     //syslog(LOG_DEBUG, "ULU Name: %s; UID: %d, HOME: %s\n", pwd.pw_gecos, (long) pwd.pw_uid, pwd.pw_dir);
@@ -89,11 +92,20 @@ get_user_homedir(char *username) {
     return ret;
 }
 
+// type keydata comment
+// ssh-rsa AAAAB... user@machine
 static void
 update_local_user(sr_session_ctx_t *session, char *username)
 {
     syslog(LOG_DEBUG, "------------------------------------------------------");
     syslog(LOG_DEBUG, "ULU username = %s", username);
+    
+    FILE *fp;
+    
+    const int LINE_SIZE = 16384;
+    const int ALG_SIZE = 64;
+    const int COMMENT_SIZE = 512;
+    char *outputline = malloc(LINE_SIZE); // algorithm + key data + comment
     
     int rc = SR_ERR_OK;
     char *xpath = malloc(strlen(username) + 1024);
@@ -105,8 +117,30 @@ update_local_user(sr_session_ctx_t *session, char *username)
     char *home = get_user_homedir(username);
     if (home != NULL) {
         syslog(LOG_DEBUG, "ULU homedir: %s", home);
+        
+        // prepare dir
+        char *dstpath = malloc(strlen(home) + 32); // + space for "/.ssh/authorized_keys"
+        strcpy(dstpath, home);
+        strcat(dstpath, "/.ssh");
+        //  TODO:  check if exists
+        int status;
+        status = mkdir(dstpath, S_IRWXU);
+        if (status == 0) {
+          syslog(LOG_DEBUG, "ULU .ssh in homedir created");
+          // TODO: change ownership
+        } else {
+            if (errno != EEXIST) {
+                syslog(LOG_DEBUG, "ULU .ssh in homedir failed - error: %d", errno);
+            }
+        }
+
+        strcat(dstpath, "/authorized_keys");
+        fp=fopen(dstpath, "w");
+        free(dstpath);
+        
     } else {
         syslog(LOG_DEBUG, "ULU there is no homedir!");
+        // TODO: clear and finish
     }
     
     sr_val_t * keys = NULL;
@@ -120,33 +154,85 @@ update_local_user(sr_session_ctx_t *session, char *username)
     } else {
         syslog(LOG_DEBUG, "ULU %d keys recieved", (int)cnt);
         for (size_t i=0; i<cnt; i++) {
-            // new xpath for given key
+            // new xpath for given key - get algorithm
             strcpy(xpath, "/ietf-system:system/authentication/user[name='");
             strcat(xpath, username);
             strcat(xpath, "']/authorized-key[name='");
             strcat(xpath, (&keys[i])->data.string_val);
-            strcat(xpath, "']//*");
+            strcat(xpath, "']/algorithm");
             syslog(LOG_DEBUG, "ULU key XPath: %s", xpath);
             
-            sr_val_t * keydatas = NULL;
-            size_t kcnt = 0;
-            rc = sr_get_items(session, xpath, &keydatas, &kcnt);
+            char *algorithm = malloc(ALG_SIZE);
+            algorithm[0] = '\0';
+            char *comment = malloc(COMMENT_SIZE);
+            strcpy(comment, username);
+            strcat(comment, "@from-sysrepo");
+            char *keydata = malloc(LINE_SIZE - ALG_SIZE - COMMENT_SIZE);
+            keydata[0] = '\0';
+            
+            int valid = 0;
+            
+            sr_val_t * data = NULL;
+            rc = sr_get_item(session, xpath, &data);
             if (SR_ERR_NOT_FOUND == rc) {
                 syslog(LOG_DEBUG, "NOT FOUND error by retrieving keydata: %s", sr_strerror(rc));
             } else if (SR_ERR_OK != rc) {
                 syslog(LOG_DEBUG, "GENERIC error by retrieving keydata: %s", sr_strerror(rc));
                 break;
             } else {
-                syslog(LOG_DEBUG, "ULU %d data recieved", (int)kcnt);
-                for (size_t j=0; j<kcnt; j++) {
-                    print_value(&keydatas[j]);
-                }
+                syslog(LOG_DEBUG, "ULU ALGORITHM");
+                print_value(data);
+                strcpy(algorithm, data->data.string_val);
+                valid++;
             }
+            
+            // new xpath for given key - get algorithm
+            strcpy(xpath, "/ietf-system:system/authentication/user[name='");
+            strcat(xpath, username);
+            strcat(xpath, "']/authorized-key[name='");
+            strcat(xpath, (&keys[i])->data.string_val);
+            strcat(xpath, "']/key-data");
+            syslog(LOG_DEBUG, "ULU key XPath: %s", xpath);
+            
+            rc = sr_get_item(session, xpath, &data);
+            if (SR_ERR_NOT_FOUND == rc) {
+                syslog(LOG_DEBUG, "NOT FOUND error by retrieving keydata: %s", sr_strerror(rc));
+            } else if (SR_ERR_OK != rc) {
+                syslog(LOG_DEBUG, "GENERIC error by retrieving keydata: %s", sr_strerror(rc));
+                break;
+            } else {
+                syslog(LOG_DEBUG, "ULU KEY-DATA");
+                print_value(data);
+                strcpy(keydata, data->data.string_val);
+                valid++;
+            }
+            
+            strcpy(outputline, algorithm);
+            strcat(outputline, " ");
+            strcat(outputline, keydata);
+            strcat(outputline, " ");
+            strcat(outputline, comment);
+            strcat(outputline, "\n");
+            
+            if (valid == 2) {
+              syslog(LOG_DEBUG, "FINAL AUTH-KEY LINE: %s", outputline);
+              fprintf(fp, outputline);
+            } else {
+              syslog(LOG_DEBUG, "ULU not all data are corectly read from sysrepo - no line is generated.");
+            }
+            
+            free(algorithm);
+            free(keydata);
+            free(comment);
         }
-    } 
+    } // end of getting keys
+    
+    if (fp != NULL) fclose(fp);
+     
     syslog(LOG_DEBUG, "------------------------------------------------------");
     free(xpath);
     free(home);
+    free(outputline);
 }
 
 static void
