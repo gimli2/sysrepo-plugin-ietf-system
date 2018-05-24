@@ -92,8 +92,19 @@ get_user_homedir(char *username) {
     return ret;
 }
 
-// type keydata comment
-// ssh-rsa AAAAB... user@machine
+static int 
+handle_sr_return(int rc) {
+    if (SR_ERR_NOT_FOUND == rc) {
+        syslog(LOG_DEBUG, "NOT FOUND error by retrieving keys: %s", sr_strerror(rc));
+        return 0;
+    } else if (SR_ERR_OK != rc) {
+        syslog(LOG_DEBUG, "GENERIC error by retrieving keys: %s", sr_strerror(rc));
+        return 0;
+    } else {
+        return 1; // no error
+    }
+}
+
 static void
 update_local_user(sr_session_ctx_t *session, char *username)
 {
@@ -109,10 +120,7 @@ update_local_user(sr_session_ctx_t *session, char *username)
     
     int rc = SR_ERR_OK;
     char *xpath = malloc(strlen(username) + 1024);
-    strcpy(xpath, "/ietf-system:system/authentication/user[name='");
-    strcat(xpath, username);
-    strcat(xpath, "']/authorized-key/name");
-    syslog(LOG_DEBUG, "ULU final XPath: %s", xpath);
+    sprintf(xpath, "/ietf-system:system/authentication/user[name='%s']/authorized-key/name", username);
     
     char *home = get_user_homedir(username);
     if (home != NULL) {
@@ -120,8 +128,7 @@ update_local_user(sr_session_ctx_t *session, char *username)
         
         // prepare dir
         char *dstpath = malloc(strlen(home) + 32); // + space for "/.ssh/authorized_keys"
-        strcpy(dstpath, home);
-        strcat(dstpath, "/.ssh");
+        sprintf(dstpath, "%s/.ssh", home);
         //  TODO:  check if exists
         int status;
         status = mkdir(dstpath, S_IRWXU);
@@ -135,7 +142,7 @@ update_local_user(sr_session_ctx_t *session, char *username)
         }
 
         strcat(dstpath, "/authorized_keys");
-        fp=fopen(dstpath, "w");
+        fp = fopen(dstpath, "w");
         free(dstpath);
         
     } else {
@@ -146,75 +153,37 @@ update_local_user(sr_session_ctx_t *session, char *username)
     sr_val_t * keys = NULL;
     size_t cnt = 0;
     rc = sr_get_items(session, xpath, &keys, &cnt);
-    if (SR_ERR_NOT_FOUND == rc) {
-        syslog(LOG_DEBUG, "NOT FOUND error by retrieving keys: %s", sr_strerror(rc));
-    } else if (SR_ERR_OK != rc) {
-        syslog(LOG_DEBUG, "GENERIC error by retrieving keys: %s", sr_strerror(rc));
-        return;
-    } else {
-        syslog(LOG_DEBUG, "ULU %d keys recieved", (int)cnt);
+    if (handle_sr_return(rc)) {
         for (size_t i=0; i<cnt; i++) {
+            int valid_parts = 0;
+                        
             // new xpath for given key - get algorithm
-            strcpy(xpath, "/ietf-system:system/authentication/user[name='");
-            strcat(xpath, username);
-            strcat(xpath, "']/authorized-key[name='");
-            strcat(xpath, (&keys[i])->data.string_val);
-            strcat(xpath, "']/algorithm");
-            syslog(LOG_DEBUG, "ULU key XPath: %s", xpath);
-            
+            sprintf(xpath, "/ietf-system:system/authentication/user[name='%s']/authorized-key[name='%s']/algorithm", username, (&keys[i])->data.string_val);
             char *algorithm = malloc(ALG_SIZE);
             algorithm[0] = '\0';
-            char *comment = malloc(COMMENT_SIZE);
-            strcpy(comment, username);
-            strcat(comment, "@from-sysrepo");
-            char *keydata = malloc(LINE_SIZE - ALG_SIZE - COMMENT_SIZE);
-            keydata[0] = '\0';
-            
-            int valid = 0;
-            
             sr_val_t * data = NULL;
             rc = sr_get_item(session, xpath, &data);
-            if (SR_ERR_NOT_FOUND == rc) {
-                syslog(LOG_DEBUG, "NOT FOUND error by retrieving keydata: %s", sr_strerror(rc));
-            } else if (SR_ERR_OK != rc) {
-                syslog(LOG_DEBUG, "GENERIC error by retrieving keydata: %s", sr_strerror(rc));
-                break;
-            } else {
-                syslog(LOG_DEBUG, "ULU ALGORITHM");
-                print_value(data);
+            if (handle_sr_return(rc)) {
                 strcpy(algorithm, data->data.string_val);
-                valid++;
+                valid_parts++;
             }
             
-            // new xpath for given key - get algorithm
-            strcpy(xpath, "/ietf-system:system/authentication/user[name='");
-            strcat(xpath, username);
-            strcat(xpath, "']/authorized-key[name='");
-            strcat(xpath, (&keys[i])->data.string_val);
-            strcat(xpath, "']/key-data");
-            syslog(LOG_DEBUG, "ULU key XPath: %s", xpath);
-            
+            // new xpath for given key - get key data
+            sprintf(xpath, "/ietf-system:system/authentication/user[name='%s']/authorized-key[name='%s']/key-data", username, (&keys[i])->data.string_val);
+            char *keydata = malloc(LINE_SIZE - ALG_SIZE - COMMENT_SIZE);
+            keydata[0] = '\0';
             rc = sr_get_item(session, xpath, &data);
-            if (SR_ERR_NOT_FOUND == rc) {
-                syslog(LOG_DEBUG, "NOT FOUND error by retrieving keydata: %s", sr_strerror(rc));
-            } else if (SR_ERR_OK != rc) {
-                syslog(LOG_DEBUG, "GENERIC error by retrieving keydata: %s", sr_strerror(rc));
-                break;
-            } else {
-                syslog(LOG_DEBUG, "ULU KEY-DATA");
-                print_value(data);
+            if (handle_sr_return(rc)) {
                 strcpy(keydata, data->data.string_val);
-                valid++;
+                valid_parts++;
             }
+
+            char *comment = malloc(COMMENT_SIZE);
+            sprintf(comment, "%s@from-sysrepo", username);
             
-            strcpy(outputline, algorithm);
-            strcat(outputline, " ");
-            strcat(outputline, keydata);
-            strcat(outputline, " ");
-            strcat(outputline, comment);
-            strcat(outputline, "\n");
+            sprintf(outputline, "%s %s %s\n", algorithm, keydata, comment);
             
-            if (valid == 2) {
+            if (valid_parts == 2) {
               syslog(LOG_DEBUG, "FINAL AUTH-KEY LINE: %s", outputline);
               fprintf(fp, outputline);
             } else {
@@ -225,11 +194,12 @@ update_local_user(sr_session_ctx_t *session, char *username)
             free(keydata);
             free(comment);
         }
-    } // end of getting keys
+    }
     
     if (fp != NULL) fclose(fp);
      
     syslog(LOG_DEBUG, "------------------------------------------------------");
+    free(keys);
     free(xpath);
     free(home);
     free(outputline);
